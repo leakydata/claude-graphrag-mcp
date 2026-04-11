@@ -37,10 +37,14 @@ The user prefers a collaborative, conversational approach:
 
 - Use the ontology in `ontology.py` for allowed node labels and relationship types
 - Normalize entity names: proper case, merge duplicates ("Python 3" and "python" -> "Python")
+- Abbreviations that ARE the name stay uppercase: CGRP, TRPV1, TRP
+- Use specific entity types: Chemical (not Entity) for "Substance P", Organism for "E. coli", Condition for "Allergic Rhinitis"
 - Be selective — extract what matters for the user's work, not every noun
 - Use `RELATED_TO` as catch-all relationship only when nothing specific fits
-- Always provide `context` on `store_fact` calls for richer retrieval later
-- Prefer specific relationship types over generic ones
+- Always provide `context` on `store_fact` calls — be specific and quantitative where possible
+- Check relationship direction: (Subject)-[VERB]->(Object) should read as a natural sentence
+- Use AUTHORED not CREATED_BY for authorship: (Person)-[AUTHORED]->(Paper)
+- Check `list_entities` before creating new entities to reuse existing names and create cross-references
 
 ## Neo4j Access
 - Bolt: `bolt://localhost:7687`

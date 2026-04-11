@@ -734,11 +734,27 @@ Look for:
 MATCH (e:Entity) WITH toLower(e.name) AS lname, collect(e.name) AS names, count(*) AS cnt WHERE cnt > 1 RETURN names, cnt ORDER BY cnt DESC
 ```
 
-### Step 5: Report
+### Step 5: Check relationship directions
+```cypher
+MATCH (s:Entity)-[r]->(t:Entity) RETURN s.name AS from, type(r) AS rel, t.name AS to LIMIT 50
+```
+
+Verify relationships read naturally as sentences: "Subject VERB Object".
+Flag any backwards relationships (e.g. Paper AUTHORED Person should be Person AUTHORED Paper).
+
+### Step 6: Check for entities that should use specific types
+Look for entities currently labeled as generic "Entity" or "Concept" that should be:
+- **Chemical** (compounds, molecules, drugs, neuropeptides)
+- **Organism** (species, strains, cell lines)
+- **Condition** (diseases, disorders, syndromes)
+- **Method** (techniques, protocols, assays)
+
+### Step 7: Report
 Provide a summary with:
 - Current graph size and health
-- Entities that should be re-labeled from catch-all "Entity" to specific types
-- Relationships that need normalization
+- Entities that should be re-labeled to more specific types
+- Relationships with wrong direction that need fixing
+- Relationships that need normalization (e.g. CREATED_BY should be AUTHORED)
 - Duplicate entities that should be merged
 - Suggested new types or relationships based on patterns you see
 - Any other schema improvements""",
