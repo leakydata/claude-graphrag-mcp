@@ -881,6 +881,128 @@ def graph_stats() -> str:
 
 
 @mcp.tool()
+def health() -> str:
+    """Check the health of all GraphRag components — Neo4j, vector indexes, OpenAI API key."""
+    checks = []
+
+    # Neo4j connectivity
+    try:
+        driver = get_driver()
+        with driver.session() as session:
+            session.run("RETURN 1")
+        checks.append("Neo4j: connected")
+    except Exception as e:
+        checks.append(f"Neo4j: FAILED — {e}")
+
+    # Vector indexes
+    try:
+        with get_driver().session() as session:
+            indexes = session.run("SHOW INDEXES YIELD name, type WHERE type = 'VECTOR' RETURN name, type")
+            idx_list = [r["name"] for r in indexes]
+            if "chunk_embedding" in idx_list and "entity_embedding" in idx_list:
+                checks.append(f"Vector indexes: OK ({', '.join(idx_list)})")
+            else:
+                checks.append(f"Vector indexes: PARTIAL — found {idx_list}, expected chunk_embedding + entity_embedding")
+    except Exception as e:
+        checks.append(f"Vector indexes: FAILED — {e}")
+
+    # OpenAI API key
+    if OPENAI_API_KEY and len(OPENAI_API_KEY) > 10:
+        checks.append(f"OpenAI API key: configured ({OPENAI_API_KEY[:8]}...)")
+    else:
+        checks.append("OpenAI API key: MISSING — embeddings will fail")
+
+    # Graph size
+    try:
+        with get_driver().session() as session:
+            count = session.run("MATCH (n) RETURN count(n) AS count").single()["count"]
+            checks.append(f"Graph size: {count} total nodes")
+    except Exception:
+        pass
+
+    return "\n".join(checks)
+
+
+@mcp.tool()
+def export_graph(format: str = "jsonl") -> str:
+    """Export the entire knowledge graph for backup or migration.
+
+    Args:
+        format: Export format — "jsonl" (default) or "cypher". JSONL is easier to parse,
+                Cypher can be re-executed to restore the graph.
+    """
+    driver = get_driver()
+
+    with driver.session() as session:
+        if format == "cypher":
+            lines = []
+            # Export entities
+            entities = session.run(
+                "MATCH (e:Entity) RETURN e.name AS name, labels(e) AS labels"
+            )
+            for r in entities:
+                labels_str = ":".join(r["labels"])
+                name_escaped = r["name"].replace("'", "\\'")
+                lines.append(f"MERGE (e:{labels_str} {{name: '{name_escaped}'}});")
+
+            # Export relationships
+            rels = session.run(
+                "MATCH (s:Entity)-[r]->(t:Entity) "
+                "RETURN s.name AS from, type(r) AS rel, t.name AS to, r.context AS context"
+            )
+            for r in rels:
+                from_escaped = r["from"].replace("'", "\\'")
+                to_escaped = r["to"].replace("'", "\\'")
+                ctx_escaped = (r["context"] or "").replace("'", "\\'")
+                lines.append(
+                    f"MATCH (s:Entity {{name: '{from_escaped}'}}), (t:Entity {{name: '{to_escaped}'}}) "
+                    f"MERGE (s)-[r:{r['rel']}]->(t) SET r.context = '{ctx_escaped}';"
+                )
+
+            return "\n".join(lines) if lines else "Graph is empty."
+
+        else:  # jsonl
+            lines = []
+            # Export entities
+            entities = session.run(
+                "MATCH (e:Entity) RETURN e.name AS name, labels(e) AS labels"
+            )
+            for r in entities:
+                lines.append(json.dumps({
+                    "type": "entity",
+                    "name": r["name"],
+                    "labels": r["labels"]
+                }))
+
+            # Export relationships
+            rels = session.run(
+                "MATCH (s:Entity)-[r]->(t:Entity) "
+                "RETURN s.name AS from, type(r) AS rel, t.name AS to, r.context AS context"
+            )
+            for r in rels:
+                lines.append(json.dumps({
+                    "type": "relationship",
+                    "from": r["from"],
+                    "rel": r["rel"],
+                    "to": r["to"],
+                    "context": r["context"]
+                }))
+
+            # Export documents
+            docs = session.run(
+                "MATCH (d:Document) RETURN d.source AS source, d.metadata AS metadata"
+            )
+            for r in docs:
+                lines.append(json.dumps({
+                    "type": "document",
+                    "source": r["source"],
+                    "metadata": r["metadata"]
+                }))
+
+            return "\n".join(lines) if lines else "Graph is empty."
+
+
+@mcp.tool()
 def merge_entities(keep: str, merge: str) -> str:
     """Merge two duplicate entities into one.
 
