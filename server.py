@@ -207,6 +207,14 @@ import re
 # Strict pattern for Cypher identifiers — only alphanumeric + underscore
 _CYPHER_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Relationship aliases — common mistakes get normalized
+_REL_ALIASES = {
+    "CREATED_BY": "AUTHORED",
+    "AUTHORED_BY": "AUTHORED",
+    "WRITTEN_BY": "AUTHORED",
+    "AFFILIATED_WITH": "MEMBER_OF",
+}
+
 
 def sanitize_cypher_label(label: str) -> str:
     """Validate a string is safe to use as a Cypher label/relationship type.
@@ -214,6 +222,14 @@ def sanitize_cypher_label(label: str) -> str:
     if not _CYPHER_IDENT_RE.match(label):
         raise ValueError(f"Invalid Cypher identifier: '{label}'. Only alphanumeric and underscores allowed.")
     return label
+
+
+def normalize_predicate(predicate: str) -> str:
+    """Normalize and validate a relationship type. Resolves aliases and sanitizes."""
+    clean = predicate.upper().replace(" ", "_").replace("-", "_")
+    clean = _REL_ALIASES.get(clean, clean)
+    sanitize_cypher_label(clean)
+    return clean
 
 
 def parse_json_arg(value: str, arg_name: str) -> dict | list:
@@ -256,11 +272,17 @@ def ingest_document(text: str, source: str, metadata: str = "{}") -> str:
     embeddings = embed_batch(chunks)
 
     with driver.session() as session:
-        # Create Document node
+        # Create Document node — extract key fields as top-level properties for easy querying
+        title = meta.get("title", source)
+        year = meta.get("year", "")
+        journal = meta.get("journal", "")
+        doi = meta.get("doi", "")
         session.run(
             "MERGE (d:Document {id: $id}) "
-            "SET d.source = $source, d.metadata = $metadata, d.chunk_count = $count",
-            id=doc_id, source=source, metadata=json.dumps(meta), count=len(chunks)
+            "SET d.source = $source, d.metadata = $metadata, d.chunk_count = $count, "
+            "    d.title = $title, d.year = $year, d.journal = $journal, d.doi = $doi",
+            id=doc_id, source=source, metadata=json.dumps(meta), count=len(chunks),
+            title=title, year=year, journal=journal, doi=doi
         )
 
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
@@ -316,13 +338,12 @@ def store_fact(
         source: Optional document source name (e.g. "src-chen-2024-trpv1"). Links entities back to the document for provenance.
     """
     driver = get_driver()
-    predicate_clean = predicate.upper().replace(" ", "_").replace("-", "_")
     subject_type = subject_type.strip().title().replace(" ", "")
     obj_type = obj_type.strip().title().replace(" ", "")
 
-    # Validate all identifiers before building Cypher
+    # Validate and normalize all identifiers before building Cypher
     try:
-        sanitize_cypher_label(predicate_clean)
+        predicate_clean = normalize_predicate(predicate)
         if subject_type != "Entity":
             sanitize_cypher_label(subject_type)
         if obj_type != "Entity":
@@ -427,9 +448,8 @@ def store_facts(facts_json: str) -> str:
             if key not in fact:
                 return f"Fact #{i} missing required field '{key}'."
 
-        predicate_clean = fact["predicate"].upper().replace(" ", "_").replace("-", "_")
         try:
-            sanitize_cypher_label(predicate_clean)
+            predicate_clean = normalize_predicate(fact["predicate"])
         except ValueError as e:
             return f"Fact #{i}: {e}"
 
@@ -501,7 +521,7 @@ def store_facts(facts_json: str) -> str:
         # Create all relationships
         rel_count = 0
         for fact in facts:
-            predicate_clean = fact["predicate"].upper().replace(" ", "_").replace("-", "_")
+            predicate_clean = normalize_predicate(fact["predicate"])
             context = fact.get("context", "")
             session.run(
                 f"MATCH (s:Entity {{name: $subject}}), (o:Entity {{name: $obj}}) "

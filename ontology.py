@@ -53,6 +53,8 @@ RESEARCH_LABELS = {
     "Finding": "Key results, claims, conclusions from a study",
     "Theory": "Theoretical frameworks, hypotheses, models",
     "Chemical": "Chemical compounds, molecules, substances, drugs, reagents",
+    "Protein": "Proteins, receptors, ion channels, enzymes, antibodies (e.g. TRPV1, TRPA1, IL-1B)",
+    "CellType": "Cell types (e.g. Macrophages, T Cells, Neutrophils, Dendritic Cells)",
     "Organism": "Species, strains, cell lines, biological organisms",
     "Condition": "Diseases, disorders, syndromes, physiological states",
 }
@@ -239,6 +241,7 @@ def validate_relationship_type(rel_type: str) -> str:
         "CREATED_BY": "AUTHORED",  # Old name → new canonical name
         "AUTHORED_BY": "AUTHORED",
         "WRITTEN_BY": "AUTHORED",
+        "AFFILIATED_WITH": "MEMBER_OF",  # Org affiliation → use MEMBER_OF on Person→Org
     }
     if normalized in aliases:
         return aliases[normalized]
