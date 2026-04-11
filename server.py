@@ -370,12 +370,19 @@ def store_fact(
             subject=subject, obj=obj, context=context
         )
 
-        # Link entities to source document for provenance
+        # Link entities to source document AND its chunks for provenance
         if source:
             for entity_name in [subject, obj]:
+                # Link to document
                 session.run(
                     "MATCH (e:Entity {name: $entity}), (d:Document {source: $source}) "
                     "MERGE (e)-[:EXTRACTED_FROM]->(d)",
+                    entity=entity_name, source=source
+                )
+                # Link to chunks from that document for chunk-level traceability
+                session.run(
+                    "MATCH (e:Entity {name: $entity}), (c:Chunk {source: $source}) "
+                    "MERGE (e)-[:MENTIONED_IN]->(c)",
                     entity=entity_name, source=source
                 )
 
@@ -504,13 +511,18 @@ def store_facts(facts_json: str) -> str:
             )
             rel_count += 1
 
-            # Provenance links
+            # Provenance links — document + chunk level
             source = fact.get("source", "")
             if source:
                 for entity_name in [fact["subject"], fact["obj"]]:
                     session.run(
                         "MATCH (e:Entity {name: $entity}), (d:Document {source: $source}) "
                         "MERGE (e)-[:EXTRACTED_FROM]->(d)",
+                        entity=entity_name, source=source
+                    )
+                    session.run(
+                        "MATCH (e:Entity {name: $entity}), (c:Chunk {source: $source}) "
+                        "MERGE (e)-[:MENTIONED_IN]->(c)",
                         entity=entity_name, source=source
                     )
 
