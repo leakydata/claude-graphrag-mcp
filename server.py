@@ -577,6 +577,7 @@ def ingest_source_prompt(
     from ontology import (
         GENERAL_LABELS, SOFTWARE_LABELS, RESEARCH_LABELS,
         GENERAL_RELATIONSHIPS, SOFTWARE_RELATIONSHIPS, RESEARCH_RELATIONSHIPS,
+        DIRECTION_GUIDE,
     )
 
     labels = dict(GENERAL_LABELS)
@@ -606,39 +607,45 @@ def ingest_source_prompt(
 
 Follow these steps carefully:
 
-### Step 1: Ingest the document
+### Step 1: Check existing entities
+Call `list_entities` to see what's already in the graph. This prevents duplicates and helps you create cross-references to existing knowledge.
+
+### Step 2: Ingest the document
 Call `ingest_document` with the full text and source name. This chunks the text and creates embeddings for vector search.
 
-### Step 2: Extract entities
-Read through the text and identify important entities. Use these allowed entity types:
+### Step 3: Extract entities
+Read through the text and identify important entities. Use these allowed entity types (pick the most specific):
 
 {entity_types}
 
 If an entity doesn't fit any type, use "Entity" as the label.
 
 **Entity naming rules:**
-- Normalize names: proper case, no abbreviations unless that IS the name
-- Merge duplicates: "Python 3", "Python", "python" → "Python"
-- Be selective — extract what matters, not every noun
+- Normalize names: proper case, no abbreviations unless that IS the name (CGRP, TRPV1 stay uppercase)
+- Merge synonyms: "B. bassiana" and "Beauveria bassiana" -> "Beauveria bassiana". Use the full canonical form.
+- Be selective — extract what matters for cross-document connections, not every noun
+- Prefer specific types: Chemical over Entity for "Substance P", Organism over Entity for "E. coli", Condition over Concept for "Allergic Rhinitis"
 
-### Step 3: Extract relationships
+### Step 4: Extract relationships
 For each pair of related entities, identify the relationship. Use these allowed types:
 
 {rel_types}
 
 If no specific type fits, use "RELATED_TO" with a descriptive context.
 
-### Step 4: Store facts
+{DIRECTION_GUIDE}
+
+### Step 5: Store facts
 For each entity-relationship-entity triple, call `store_fact` with:
-- subject: the source entity
+- subject: the source entity (the Subject in the natural sentence)
 - predicate: the relationship type
-- obj: the target entity
-- context: a brief description of why this relationship exists
+- obj: the target entity (the Object in the natural sentence)
+- context: a specific, quantitative description. "91.67% mortality at day 4" not "high mortality".
 
-### Step 5: Report
-Summarize what was stored: number of chunks, entities extracted, relationships created.
+If an entity from this source already exists in the graph (from Step 1), reuse its exact name to create cross-document connections.
 
-**Important:** Always provide context on store_fact calls — it enriches the embeddings and makes retrieval better later.""",
+### Step 6: Report
+Summarize what was stored: number of chunks, entities extracted, relationships created, and any cross-references to existing entities.""",
         }
     ]
 

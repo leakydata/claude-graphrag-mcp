@@ -24,12 +24,12 @@ STRUCTURAL_LABELS = {
 # General-purpose entity types
 GENERAL_LABELS = {
     "Entity": "Catch-all for unclassified named entities (review periodically)",
-    "Person": "People, authors, contributors, users",
-    "Organization": "Companies, institutions, teams, groups",
+    "Person": "People, authors, contributors, researchers",
+    "Organization": "Companies, institutions, universities, labs, teams",
     "Location": "Geographic places, addresses, regions",
     "Event": "Named events, incidents, milestones, releases",
-    "Concept": "Abstract ideas, topics, themes, paradigms",
-    "Tool": "Software tools, utilities, applications",
+    "Concept": "Abstract ideas, topics, themes, paradigms, biological processes, mechanisms",
+    "Tool": "Software tools, utilities, instruments, equipment",
 }
 
 # Software/Code domain
@@ -47,11 +47,14 @@ SOFTWARE_LABELS = {
 # Research/Academic domain
 RESEARCH_LABELS = {
     "Paper": "Academic publications, articles, preprints",
-    "Dataset": "Named datasets used in research or ML",
-    "Method": "Algorithms, techniques, approaches, architectures",
+    "Dataset": "Named datasets, databases, collections used in research",
+    "Method": "Algorithms, techniques, protocols, assays, statistical approaches",
     "Metric": "Evaluation measures, benchmarks, scores",
-    "Finding": "Key results, claims, conclusions",
-    "Theory": "Theoretical frameworks, hypotheses",
+    "Finding": "Key results, claims, conclusions from a study",
+    "Theory": "Theoretical frameworks, hypotheses, models",
+    "Chemical": "Chemical compounds, molecules, substances, drugs, reagents",
+    "Organism": "Species, strains, cell lines, biological organisms",
+    "Condition": "Diseases, disorders, syndromes, physiological states",
 }
 
 # All entity labels (excluding structural)
@@ -70,20 +73,24 @@ STRUCTURAL_RELATIONSHIPS = {
 }
 
 # General-purpose relationships (the core ~15)
+# Direction convention: (Subject) -[VERB]-> (Object) should read naturally
+# e.g. (Person) -[AUTHORED]-> (Paper), (Method) -[CAUSES]-> (Effect)
 GENERAL_RELATIONSHIPS = {
-    "RELATED_TO": "Generic association (use when no specific type fits)",
-    "PART_OF": "Composition/membership (X is part of Y)",
-    "HAS_PART": "Inverse of PART_OF",
-    "LOCATED_IN": "Spatial containment",
-    "MEMBER_OF": "Person/entity belongs to organization/group",
-    "CREATED_BY": "Authorship, creation",
+    "RELATED_TO": "Generic association — only when no specific type fits. Always add context.",
+    "PART_OF": "X is a component/member of Y (e.g. CGRP is PART_OF neurogenic inflammation)",
+    "HAS_PART": "X contains/includes Y (inverse of PART_OF)",
+    "LOCATED_IN": "Spatial containment (e.g. lab LOCATED_IN university)",
+    "MEMBER_OF": "Person/entity belongs to an organization/group",
+    "AUTHORED": "Person wrote/created a paper or work. Direction: (Person)-[AUTHORED]->(Paper)",
     "OCCURRED_AT": "Temporal placement of events",
-    "CAUSES": "Causal relationship",
-    "DEPENDS_ON": "Dependency (general)",
-    "SIMILAR_TO": "Similarity or equivalence",
-    "DERIVED_FROM": "Origin, inheritance, fork",
-    "MENTIONS": "Reference without deep relationship",
-    "DESCRIBES": "Documentation, explanation",
+    "CAUSES": "X causes/triggers/induces Y. Direction: (Cause)-[CAUSES]->(Effect)",
+    "INHIBITS": "X suppresses/blocks/reduces Y. Direction: (Inhibitor)-[INHIBITS]->(Target)",
+    "DEPENDS_ON": "X requires Y to function",
+    "SIMILAR_TO": "Similarity or equivalence between two entities",
+    "DERIVED_FROM": "X originates from/is based on Y",
+    "MENTIONS": "X references Y without a deeper relationship",
+    "DESCRIBES": "X documents/explains Y",
+    "TREATS": "X is used to treat/address Y. Direction: (Treatment)-[TREATS]->(Condition)",
 }
 
 # Software/Code relationships
@@ -102,13 +109,16 @@ SOFTWARE_RELATIONSHIPS = {
 
 # Research/Academic relationships
 RESEARCH_RELATIONSHIPS = {
-    "CITES": "Citation between papers",
-    "EVALUATES_ON": "Evaluation on a dataset/benchmark",
-    "PROPOSES": "Paper proposes a method/theory",
-    "OUTPERFORMS": "Comparative superiority",
-    "USES_METHOD": "Application of a method",
-    "TRAINED_ON": "Model training data",
-    "REPLICATES": "Replication of prior work",
+    "CITES": "Paper cites another paper. Direction: (Citing)-[CITES]->(Cited)",
+    "EVALUATES_ON": "Evaluated on a dataset/benchmark",
+    "PROPOSES": "Paper proposes a method/theory/finding. Direction: (Paper)-[PROPOSES]->(Finding)",
+    "OUTPERFORMS": "X achieves better results than Y. Always include metrics in context.",
+    "USES_METHOD": "Paper/study applies a method. Direction: (Paper)-[USES_METHOD]->(Method)",
+    "TRAINED_ON": "Model trained on a dataset",
+    "REPLICATES": "Study replicates prior work",
+    "TARGETS": "X acts on/affects Y. Direction: (Agent)-[TARGETS]->(Target). For drugs, chemicals, organisms.",
+    "PRODUCES": "X generates/yields/synthesizes Y. Direction: (Producer)-[PRODUCES]->(Product)",
+    "INTERACTS_WITH": "Bidirectional interaction between entities (e.g. drug-receptor, gene-gene)",
 }
 
 ALL_RELATIONSHIPS = {
@@ -117,6 +127,35 @@ ALL_RELATIONSHIPS = {
     **SOFTWARE_RELATIONSHIPS,
     **RESEARCH_RELATIONSHIPS,
 }
+
+# ---------------------------------------------------------------------------
+# Relationship direction guide — helps extractors get the arrow right
+# ---------------------------------------------------------------------------
+DIRECTION_GUIDE = """
+## Relationship Direction Convention
+
+All relationships are directional: (Subject) -[VERB]-> (Object).
+The triple should read as a natural sentence.
+
+### Common patterns:
+- (Person) -[AUTHORED]-> (Paper)
+- (Paper) -[PROPOSES]-> (Finding)
+- (Paper) -[USES_METHOD]-> (Method)
+- (Paper) -[CITES]-> (Paper)
+- (Person) -[MEMBER_OF]-> (Organization)
+- (Cause) -[CAUSES]-> (Effect)
+- (Inhibitor) -[INHIBITS]-> (Target)
+- (Treatment) -[TREATS]-> (Condition)
+- (Chemical) -[TARGETS]-> (Receptor/Organism)
+- (Method) -[OUTPERFORMS]-> (Method) — with metrics in context
+- (X) -[PART_OF]-> (Y) — X is a component of Y
+- (Organism) -[PRODUCES]-> (Chemical)
+- (Drug) -[INTERACTS_WITH]-> (Receptor)
+
+### Test: read it aloud
+"Ulusoy AUTHORED the rhinitis paper" ✓
+"The rhinitis paper AUTHORED Ulusoy" ✗
+"""
 
 # ---------------------------------------------------------------------------
 # Extraction prompt template — used when LLM extracts entities from text
@@ -135,18 +174,22 @@ If an entity doesn't fit any type above, use "Entity" with a descriptive `subtyp
 
 If a relationship doesn't fit any type above, use "RELATED_TO" with a descriptive `context`.
 
+{direction_guide}
+
 ## Rules
-1. Entity names should be normalized: proper case, no abbreviations unless the abbreviation IS the name.
-2. Merge duplicates: "Python 3", "Python", "python" → "Python".
+1. Entity names should be normalized: proper case, no abbreviations unless the abbreviation IS the name (e.g. "CGRP", "TRPV1" stay uppercase).
+2. Merge duplicates: "B. bassiana" and "Beauveria bassiana" → "Beauveria bassiana". Use the full canonical name.
 3. Be specific with relationship types — prefer specific over RELATED_TO.
 4. Every entity MUST have a type from the allowed list.
-5. Return JSON array of objects with this structure:
+5. Always include context that is specific and quantitative where possible.
+6. Check relationship direction reads naturally as a sentence: Subject VERB Object.
+7. Return JSON array of objects with this structure:
 
 For entities:
 {{"type": "entity", "label": "Person", "name": "Guido van Rossum", "properties": {{"subtype": null}}}}
 
 For relationships:
-{{"type": "relationship", "source": "Guido van Rossum", "target": "Python", "relationship": "CREATED_BY", "context": "Creator of the Python programming language"}}
+{{"type": "relationship", "source": "Guido van Rossum", "target": "Python", "relationship": "AUTHORED", "context": "Creator of the Python programming language"}}
 
 ## Text
 {text}
@@ -181,6 +224,7 @@ def get_extraction_prompt(text: str, domains: list[str] | None = None) -> str:
     return ENTITY_EXTRACTION_PROMPT.format(
         entity_types=entity_types,
         relationship_types=relationship_types,
+        direction_guide=DIRECTION_GUIDE,
         text=text,
     )
 
@@ -190,6 +234,14 @@ def validate_relationship_type(rel_type: str) -> str:
     normalized = rel_type.upper().replace(" ", "_").replace("-", "_")
     if normalized in ALL_RELATIONSHIPS:
         return normalized
+    # Handle common aliases
+    aliases = {
+        "CREATED_BY": "AUTHORED",  # Old name → new canonical name
+        "AUTHORED_BY": "AUTHORED",
+        "WRITTEN_BY": "AUTHORED",
+    }
+    if normalized in aliases:
+        return aliases[normalized]
     # Fuzzy fallback — check if it's a substring match
     for known in ALL_RELATIONSHIPS:
         if normalized in known or known in normalized:
