@@ -881,6 +881,194 @@ def graph_stats() -> str:
 
 
 @mcp.tool()
+def merge_entities(keep: str, merge: str) -> str:
+    """Merge two duplicate entities into one.
+
+    Keeps the 'keep' entity and transfers all relationships from 'merge' to it,
+    then deletes the 'merge' entity. Use this for deduplication — when the same
+    real-world entity has multiple nodes (e.g. "TRPV1 receptor" and "TRPV1").
+
+    Args:
+        keep: The entity name to keep (the canonical name).
+        merge: The entity name to merge into 'keep' (will be deleted).
+    """
+    driver = get_driver()
+
+    with driver.session() as session:
+        # Verify both entities exist
+        keep_node = session.run(
+            "MATCH (e:Entity {name: $name}) RETURN e.name AS name, labels(e) AS labels",
+            name=keep
+        ).single()
+        merge_node = session.run(
+            "MATCH (e:Entity {name: $name}) RETURN e.name AS name, labels(e) AS labels",
+            name=merge
+        ).single()
+
+        if not keep_node:
+            return f"Entity '{keep}' not found."
+        if not merge_node:
+            return f"Entity '{merge}' not found."
+
+        # Copy type labels from merge to keep
+        merge_labels = [l for l in merge_node["labels"] if l != "Entity"]
+        for label in merge_labels:
+            try:
+                sanitize_cypher_label(label)
+                session.run(f"MATCH (e:Entity {{name: $name}}) SET e:{label}", name=keep)
+            except ValueError:
+                pass
+
+        # Transfer outgoing relationships
+        out_result = session.run(
+            "MATCH (m:Entity {name: $merge})-[r]->(target) "
+            "WHERE target.name <> $keep "
+            "RETURN type(r) AS rel_type, target.name AS target, r.context AS context",
+            merge=merge, keep=keep
+        )
+        out_transferred = 0
+        for record in out_result:
+            rel_type = record["rel_type"]
+            try:
+                sanitize_cypher_label(rel_type)
+            except ValueError:
+                continue
+            session.run(
+                f"MATCH (k:Entity {{name: $keep}}), (t:Entity {{name: $target}}) "
+                f"MERGE (k)-[r:{rel_type}]->(t) "
+                f"SET r.context = $context",
+                keep=keep, target=record["target"], context=record["context"]
+            )
+            out_transferred += 1
+
+        # Transfer incoming relationships
+        in_result = session.run(
+            "MATCH (source)-[r]->(m:Entity {name: $merge}) "
+            "WHERE source.name <> $keep "
+            "RETURN type(r) AS rel_type, source.name AS source, r.context AS context",
+            merge=merge, keep=keep
+        )
+        in_transferred = 0
+        for record in in_result:
+            rel_type = record["rel_type"]
+            try:
+                sanitize_cypher_label(rel_type)
+            except ValueError:
+                continue
+            session.run(
+                f"MATCH (s:Entity {{name: $source}}), (k:Entity {{name: $keep}}) "
+                f"MERGE (s)-[r:{rel_type}]->(k) "
+                f"SET r.context = $context",
+                source=record["source"], keep=keep, context=record["context"]
+            )
+            in_transferred += 1
+
+        # Transfer EXTRACTED_FROM and MENTIONED_IN provenance
+        session.run(
+            "MATCH (m:Entity {name: $merge})-[r:EXTRACTED_FROM]->(d) "
+            "MATCH (k:Entity {name: $keep}) "
+            "MERGE (k)-[:EXTRACTED_FROM]->(d)",
+            merge=merge, keep=keep
+        )
+        session.run(
+            "MATCH (m:Entity {name: $merge})-[r:MENTIONED_IN]->(c) "
+            "MATCH (k:Entity {name: $keep}) "
+            "MERGE (k)-[:MENTIONED_IN]->(c)",
+            merge=merge, keep=keep
+        )
+
+        # Delete the merged entity and all its relationships
+        session.run(
+            "MATCH (m:Entity {name: $merge}) DETACH DELETE m",
+            merge=merge
+        )
+
+    return (
+        f"Merged '{merge}' into '{keep}': "
+        f"{out_transferred} outgoing + {in_transferred} incoming relationships transferred. "
+        f"'{merge}' deleted."
+    )
+
+
+@mcp.tool()
+def find_duplicates(similarity_threshold: float = 0.92) -> str:
+    """Find potential duplicate entities by name similarity and embedding distance.
+
+    Returns pairs of entities that might be the same real-world thing.
+    Use merge_entities to combine confirmed duplicates.
+
+    Args:
+        similarity_threshold: Minimum cosine similarity to consider as duplicate (default 0.92).
+    """
+    driver = get_driver()
+    duplicates = []
+
+    with driver.session() as session:
+        # Check for case-insensitive name matches first
+        case_dupes = session.run(
+            "MATCH (e:Entity) "
+            "WITH toLower(e.name) AS lname, collect(e.name) AS names, count(*) AS cnt "
+            "WHERE cnt > 1 RETURN names, cnt ORDER BY cnt DESC"
+        )
+        for record in case_dupes:
+            duplicates.append({
+                "type": "exact_match",
+                "names": record["names"],
+                "reason": "Same name (case-insensitive)"
+            })
+
+        # Check for embedding similarity between all entity pairs
+        entities = session.run(
+            "MATCH (e:Entity) WHERE e.embedding IS NOT NULL "
+            "RETURN e.name AS name, labels(e) AS labels"
+        )
+        entity_list = [{"name": r["name"], "labels": r["labels"]} for r in entities]
+
+        # For each entity, find its nearest neighbors by embedding
+        for entity in entity_list:
+            similar = session.run(
+                dedent("""\
+                    MATCH (e:Entity {name: $name})
+                    CALL db.index.vector.queryNodes('entity_embedding', 5, e.embedding)
+                    YIELD node, score
+                    WHERE node.name <> $name AND score >= $threshold
+                    RETURN node.name AS similar_name, score
+                """),
+                name=entity["name"], threshold=similarity_threshold
+            )
+            for record in similar:
+                pair = tuple(sorted([entity["name"], record["similar_name"]]))
+                dup_entry = {
+                    "type": "embedding_similarity",
+                    "names": list(pair),
+                    "similarity": round(record["score"], 4),
+                    "reason": f"Cosine similarity {record['score']:.4f}"
+                }
+                # Avoid duplicate pairs
+                if dup_entry not in duplicates:
+                    duplicates.append(dup_entry)
+
+    if not duplicates:
+        return "No potential duplicates found."
+
+    # Deduplicate pairs
+    seen_pairs = set()
+    unique_dupes = []
+    for d in duplicates:
+        key = tuple(sorted(d["names"]))
+        if key not in seen_pairs:
+            seen_pairs.add(key)
+            unique_dupes.append(d)
+
+    lines = [f"Potential duplicates ({len(unique_dupes)}):"]
+    for d in unique_dupes:
+        lines.append(f"  - {' / '.join(d['names'])} — {d['reason']}")
+    lines.append("\nUse merge_entities(keep='canonical_name', merge='duplicate_name') to merge.")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def get_schema() -> str:
     """Get the current graph schema — node labels, relationship types, and property keys.
 
