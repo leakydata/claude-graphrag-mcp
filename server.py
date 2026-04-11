@@ -248,9 +248,12 @@ def ingest_document(text: str, source: str, metadata: str = "{}") -> str:
         metadata: Optional JSON string of extra metadata to store on the document node.
     """
     driver = get_driver()
-    meta = json.loads(metadata) if metadata else {}
+    meta = parse_json_arg(metadata, "metadata") if metadata else {}
     chunks = chunk_text(text)
     doc_id = hashlib.sha256(f"{source}:{text[:200]}".encode()).hexdigest()[:16]
+
+    # Batch embed all chunks in one API call
+    embeddings = embed_batch(chunks)
 
     with driver.session() as session:
         # Create Document node
@@ -260,9 +263,8 @@ def ingest_document(text: str, source: str, metadata: str = "{}") -> str:
             id=doc_id, source=source, metadata=json.dumps(meta), count=len(chunks)
         )
 
-        for i, chunk in enumerate(chunks):
+        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
             chunk_id = make_chunk_id(source, i)
-            embedding = embed(chunk)
 
             session.run(
                 "MERGE (c:Chunk {id: $id}) "
@@ -317,6 +319,16 @@ def store_fact(
     predicate_clean = predicate.upper().replace(" ", "_").replace("-", "_")
     subject_type = subject_type.strip().title().replace(" ", "")
     obj_type = obj_type.strip().title().replace(" ", "")
+
+    # Validate all identifiers before building Cypher
+    try:
+        sanitize_cypher_label(predicate_clean)
+        if subject_type != "Entity":
+            sanitize_cypher_label(subject_type)
+        if obj_type != "Entity":
+            sanitize_cypher_label(obj_type)
+    except ValueError as e:
+        return f"Rejected: {e}"
 
     created = []
 
