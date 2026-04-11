@@ -550,6 +550,196 @@ def graph_stats() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Prompts — reusable workflow templates for any MCP client
+# ---------------------------------------------------------------------------
+
+@mcp.prompt(
+    name="ingest_source",
+    title="Ingest a Source into the Knowledge Graph",
+    description="Guides you through reading a source, extracting entities and relationships, "
+    "and storing everything in the knowledge graph with proper provenance.",
+)
+def ingest_source_prompt(
+    source_text: str,
+    source_name: str,
+    domains: str = "general, software, research",
+) -> list[dict]:
+    """Parameterized prompt for ingesting a source document.
+
+    Args:
+        source_text: The text content to ingest.
+        source_name: A label for the source (filename, URL, title).
+        domains: Comma-separated domains to use for extraction (general, software, research).
+    """
+    domain_list = [d.strip() for d in domains.split(",")]
+
+    # Build entity/relationship type lists from ontology
+    from ontology import (
+        GENERAL_LABELS, SOFTWARE_LABELS, RESEARCH_LABELS,
+        GENERAL_RELATIONSHIPS, SOFTWARE_RELATIONSHIPS, RESEARCH_RELATIONSHIPS,
+    )
+
+    labels = dict(GENERAL_LABELS)
+    rels = dict(GENERAL_RELATIONSHIPS)
+    if "software" in domain_list:
+        labels.update(SOFTWARE_LABELS)
+        rels.update(SOFTWARE_RELATIONSHIPS)
+    if "research" in domain_list:
+        labels.update(RESEARCH_LABELS)
+        rels.update(RESEARCH_RELATIONSHIPS)
+
+    entity_types = "\n".join(f"  - **{k}**: {v}" for k, v in labels.items())
+    rel_types = "\n".join(f"  - **{k}**: {v}" for k, v in rels.items())
+
+    return [
+        {
+            "role": "user",
+            "content": f"""Please ingest the following source into the knowledge graph.
+
+## Source
+**Name:** {source_name}
+
+**Content:**
+{source_text}
+
+## Instructions
+
+Follow these steps carefully:
+
+### Step 1: Ingest the document
+Call `ingest_document` with the full text and source name. This chunks the text and creates embeddings for vector search.
+
+### Step 2: Extract entities
+Read through the text and identify important entities. Use these allowed entity types:
+
+{entity_types}
+
+If an entity doesn't fit any type, use "Entity" as the label.
+
+**Entity naming rules:**
+- Normalize names: proper case, no abbreviations unless that IS the name
+- Merge duplicates: "Python 3", "Python", "python" → "Python"
+- Be selective — extract what matters, not every noun
+
+### Step 3: Extract relationships
+For each pair of related entities, identify the relationship. Use these allowed types:
+
+{rel_types}
+
+If no specific type fits, use "RELATED_TO" with a descriptive context.
+
+### Step 4: Store facts
+For each entity-relationship-entity triple, call `store_fact` with:
+- subject: the source entity
+- predicate: the relationship type
+- obj: the target entity
+- context: a brief description of why this relationship exists
+
+### Step 5: Report
+Summarize what was stored: number of chunks, entities extracted, relationships created.
+
+**Important:** Always provide context on store_fact calls — it enriches the embeddings and makes retrieval better later.""",
+        }
+    ]
+
+
+@mcp.prompt(
+    name="query_knowledge",
+    title="Query the Knowledge Graph",
+    description="Guides you through answering a question using hybrid vector search "
+    "and graph traversal across the knowledge graph.",
+)
+def query_knowledge_prompt(question: str) -> list[dict]:
+    """Parameterized prompt for querying the knowledge graph.
+
+    Args:
+        question: The question to answer using the knowledge graph.
+    """
+    return [
+        {
+            "role": "user",
+            "content": f"""Answer this question using the knowledge graph:
+
+**Question:** {question}
+
+## Instructions
+
+Follow these steps to find a comprehensive answer:
+
+### Step 1: Semantic search
+Call `query` with the question. This searches both text chunks (vector similarity) and entities (graph + vector). Review the results for relevant information.
+
+### Step 2: Explore the graph
+If the query results mention specific entities, call `get_neighbors` on the most relevant ones to discover related information that vector search might have missed. Follow relationship chains for multi-hop reasoning.
+
+### Step 3: Targeted search (if needed)
+If the initial results are insufficient:
+- Try `list_entities` with relevant name patterns to find entities you might have missed
+- Use `cypher_query` for structured queries (e.g., "find all entities of type Technology that have DEPENDS_ON relationships")
+
+### Step 4: Synthesize
+Combine findings from vector search and graph traversal into a coherent answer. Cite the sources (document names) where the information came from.
+
+If the knowledge graph doesn't contain enough information to answer the question, say so clearly and suggest what could be ingested to fill the gap.""",
+        }
+    ]
+
+
+@mcp.prompt(
+    name="review_ontology",
+    title="Review and Improve the Knowledge Graph Ontology",
+    description="Analyzes the current state of the knowledge graph and suggests "
+    "schema improvements — new entity types, relationship cleanup, deduplication.",
+)
+def review_ontology_prompt() -> list[dict]:
+    """Prompt for reviewing and improving the graph ontology."""
+    return [
+        {
+            "role": "user",
+            "content": """Review the current state of the knowledge graph and suggest improvements.
+
+## Instructions
+
+### Step 1: Get graph statistics
+Call `graph_stats` to see overall counts.
+
+### Step 2: Inspect entity types
+Use `cypher_query` to analyze the graph structure:
+
+```cypher
+MATCH (e:Entity) RETURN labels(e) AS labels, count(e) AS count ORDER BY count DESC
+```
+
+Check for entities still using the catch-all "Entity" label that could be promoted to proper types.
+
+### Step 3: Inspect relationships
+```cypher
+MATCH ()-[r]->() RETURN type(r) AS type, count(r) AS count ORDER BY count DESC
+```
+
+Look for:
+- Overuse of RELATED_TO (should be replaced with specific types)
+- Duplicate or near-duplicate relationship types
+- Missing relationship types that would improve queries
+
+### Step 4: Check for duplicate entities
+```cypher
+MATCH (e:Entity) WITH toLower(e.name) AS lname, collect(e.name) AS names, count(*) AS cnt WHERE cnt > 1 RETURN names, cnt ORDER BY cnt DESC
+```
+
+### Step 5: Report
+Provide a summary with:
+- Current graph size and health
+- Entities that should be re-labeled from catch-all "Entity" to specific types
+- Relationships that need normalization
+- Duplicate entities that should be merged
+- Suggested new types or relationships based on patterns you see
+- Any other schema improvements""",
+        }
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
