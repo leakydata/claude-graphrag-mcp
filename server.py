@@ -252,12 +252,14 @@ def store_fact(
     context: str = "",
     subject_type: str = "Entity",
     obj_type: str = "Entity",
+    source: str = "",
 ) -> str:
     """Store a knowledge triple (subject -[predicate]-> object) in the graph.
 
     Creates typed nodes and a relationship between them. Nodes get both
     a specific label (e.g. Person, Chemical) AND the base Entity label
-    for unified querying.
+    for unified querying. Only embeds new entities to avoid overwriting
+    and wasting API calls.
 
     Args:
         subject: The source entity name (e.g. "Capsaicin", "Jianwei Chen").
@@ -266,6 +268,7 @@ def store_fact(
         context: Description of this relationship. Be specific and quantitative.
         subject_type: Entity type for subject (e.g. "Chemical", "Person", "Paper", "Method"). Default "Entity".
         obj_type: Entity type for object (e.g. "Concept", "Condition", "Organism"). Default "Entity".
+        source: Optional document source name (e.g. "src-chen-2024-trpv1"). Links entities back to the document for provenance.
     """
     driver = get_driver()
     predicate_clean = predicate.upper().replace(" ", "_").replace("-", "_")
@@ -274,26 +277,42 @@ def store_fact(
     subject_type = subject_type.strip().title().replace(" ", "")
     obj_type = obj_type.strip().title().replace(" ", "")
 
-    with driver.session() as session:
-        # Create/update entities with embeddings and typed labels
-        for entity_name, entity_type in [(subject, subject_type), (obj, obj_type)]:
-            emb = embed(entity_name + (f" — {context}" if context else ""))
-            # Always add :Entity as base label + the specific type label
-            if entity_type and entity_type != "Entity":
-                session.run(
-                    f"MERGE (e:Entity {{name: $name}}) "
-                    f"SET e.embedding = $embedding "
-                    f"SET e:{entity_type}",
-                    name=entity_name, embedding=emb
-                )
-            else:
-                session.run(
-                    "MERGE (e:Entity {name: $name}) "
-                    "SET e.embedding = $embedding",
-                    name=entity_name, embedding=emb
-                )
+    created = []
 
-        # Create relationship (using APOC-free approach with dynamic rel type)
+    with driver.session() as session:
+        for entity_name, entity_type in [(subject, subject_type), (obj, obj_type)]:
+            # Check if entity already exists
+            exists = session.run(
+                "MATCH (e:Entity {name: $name}) RETURN e.name AS name",
+                name=entity_name
+            ).single()
+
+            if exists:
+                # Entity exists — add type label if not already present, skip embedding
+                if entity_type and entity_type != "Entity":
+                    session.run(
+                        f"MATCH (e:Entity {{name: $name}}) SET e:{entity_type}",
+                        name=entity_name
+                    )
+            else:
+                # New entity — embed and create with labels
+                emb = embed(entity_name)
+                if entity_type and entity_type != "Entity":
+                    session.run(
+                        f"MERGE (e:Entity {{name: $name}}) "
+                        f"SET e.embedding = $embedding "
+                        f"SET e:{entity_type}",
+                        name=entity_name, embedding=emb
+                    )
+                else:
+                    session.run(
+                        "MERGE (e:Entity {name: $name}) "
+                        "SET e.embedding = $embedding",
+                        name=entity_name, embedding=emb
+                    )
+                created.append(entity_name)
+
+        # Create relationship
         session.run(
             f"MATCH (s:Entity {{name: $subject}}), (o:Entity {{name: $obj}}) "
             f"MERGE (s)-[r:{predicate_clean}]->(o) "
@@ -301,9 +320,19 @@ def store_fact(
             subject=subject, obj=obj, context=context
         )
 
+        # Link entities to source document for provenance
+        if source:
+            for entity_name in [subject, obj]:
+                session.run(
+                    "MATCH (e:Entity {name: $entity}), (d:Document {source: $source}) "
+                    "MERGE (e)-[:EXTRACTED_FROM]->(d)",
+                    entity=entity_name, source=source
+                )
+
     subj_label = f":{subject_type}" if subject_type != "Entity" else ""
     obj_label = f":{obj_type}" if obj_type != "Entity" else ""
-    return f"Stored: ({subject}{subj_label}) -[{predicate_clean}]-> ({obj}{obj_label})" + (f" | {context}" if context else "")
+    new_flag = f" (new: {', '.join(created)})" if created else ""
+    return f"Stored: ({subject}{subj_label}) -[{predicate_clean}]-> ({obj}{obj_label}){new_flag}" + (f" | {context}" if context else "")
 
 
 @mcp.tool()
