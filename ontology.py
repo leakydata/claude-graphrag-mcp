@@ -119,6 +119,8 @@ RESEARCH_RELATIONSHIPS = {
     "TRAINED_ON": "Model trained on a dataset",
     "REPLICATES": "Study replicates prior work",
     "TARGETS": "X acts on/affects Y. Direction: (Agent)-[TARGETS]->(Target). For drugs, chemicals, organisms.",
+    "ACTIVATES": "X activates/stimulates/upregulates Y. Direction: (Activator)-[ACTIVATES]->(Target)",
+    "EXPRESSED_IN": "Protein/receptor is expressed in a cell type or tissue. Direction: (Protein)-[EXPRESSED_IN]->(CellType)",
     "PRODUCES": "X generates/yields/synthesizes Y. Direction: (Producer)-[PRODUCES]->(Product)",
     "INTERACTS_WITH": "Bidirectional interaction between entities (e.g. drug-receptor, gene-gene)",
 }
