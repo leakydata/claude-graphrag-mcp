@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "graphrag": {
+      "command": "/home/scholyx/Documents/code/GraphRag/.venv/bin/python",
+      "args": ["/home/scholyx/Documents/code/GraphRag/server.py"],
+      "cwd": "/home/scholyx/Documents/code/GraphRag"
+    },
+    "neo4j-data-modeling": {
+      "command": "uvx",
+      "args": ["mcp-neo4j-data-modeling@0.8.2", "--transport", "stdio"]
+    }
+  }
+}
