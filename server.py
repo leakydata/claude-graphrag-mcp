@@ -408,12 +408,40 @@ def store_facts(facts_json: str) -> str:
                        "obj_type": "Concept", "source": "src-chen-2024-trpv1"}]
     """
     driver = get_driver()
-    facts = json.loads(facts_json)
+    facts = parse_json_arg(facts_json, "facts_json")
 
-    if not facts:
-        return "No facts provided."
+    if not isinstance(facts, list) or not facts:
+        return "No facts provided. Expected a JSON array of fact objects."
 
-    # Collect all unique entities that need to be created
+    # Validate all identifiers upfront before touching the database
+    entity_types_map = {}
+    for i, fact in enumerate(facts):
+        for key in ("subject", "predicate", "obj"):
+            if key not in fact:
+                return f"Fact #{i} missing required field '{key}'."
+
+        predicate_clean = fact["predicate"].upper().replace(" ", "_").replace("-", "_")
+        try:
+            sanitize_cypher_label(predicate_clean)
+        except ValueError as e:
+            return f"Fact #{i}: {e}"
+
+        st = fact.get("subject_type", "Entity").strip().title().replace(" ", "")
+        ot = fact.get("obj_type", "Entity").strip().title().replace(" ", "")
+
+        for label in (st, ot):
+            if label != "Entity":
+                try:
+                    sanitize_cypher_label(label)
+                except ValueError as e:
+                    return f"Fact #{i}: {e}"
+
+        if fact["subject"] not in entity_types_map:
+            entity_types_map[fact["subject"]] = st
+        if fact["obj"] not in entity_types_map:
+            entity_types_map[fact["obj"]] = ot
+
+    # All validated — proceed with database operations
     with driver.session() as session:
         # Find which entities already exist
         all_entity_names = set()
@@ -432,24 +460,12 @@ def store_facts(facts_json: str) -> str:
 
         new_entities = all_entity_names - existing
 
-        # Build embedding texts for new entities — include type for better embeddings
-        entity_types_map = {}
-        for fact in facts:
-            st = fact.get("subject_type", "Entity").strip().title().replace(" ", "")
-            ot = fact.get("obj_type", "Entity").strip().title().replace(" ", "")
-            # First mention wins for type assignment
-            if fact["subject"] not in entity_types_map:
-                entity_types_map[fact["subject"]] = st
-            if fact["obj"] not in entity_types_map:
-                entity_types_map[fact["obj"]] = ot
-
-        # Batch embed all new entities
+        # Batch embed all new entities in one API call
         new_entities_list = sorted(new_entities)
         if new_entities_list:
             embed_texts = [f"{name} ({entity_types_map.get(name, 'Entity')})" for name in new_entities_list]
             embeddings = embed_batch(embed_texts)
 
-            # Create all new entities
             for name, emb in zip(new_entities_list, embeddings):
                 entity_type = entity_types_map.get(name, "Entity")
                 if entity_type and entity_type != "Entity":
@@ -762,24 +778,29 @@ def delete_document(source: str) -> str:
 
 
 @mcp.tool()
-def cypher_query(query: str, params: str = "{}") -> str:
+def cypher_query(query: str, params: str = "{}", allow_write: bool = False) -> str:
     """Execute a raw Cypher query against the Neo4j knowledge graph.
 
-    Use this for ad-hoc exploration, complex queries, schema inspection,
-    or anything the other tools don't cover.
+    Read-only by default. Use this for ad-hoc exploration, complex queries,
+    schema inspection, or anything the other tools don't cover.
 
     Args:
         query: A Cypher query string (e.g. "MATCH (n) RETURN labels(n), count(n)").
         params: Optional JSON string of query parameters (e.g. '{"name": "Python"}').
+        allow_write: Set to true to allow destructive operations (DELETE, DROP, REMOVE). Default false.
     """
     driver = get_driver()
-    parsed_params = json.loads(params) if params else {}
+    parsed_params = parse_json_arg(params, "params") if params else {}
 
-    # Block destructive operations for safety
+    # Block destructive operations unless explicitly allowed
     upper = query.upper().strip()
-    if any(kw in upper for kw in ["DROP", "DELETE", "REMOVE", "DETACH"]):
-        if not any(safe in upper for safe in ["RETURN"]):
-            return "Blocked: destructive queries without RETURN clause are not allowed. Use delete_document for safe deletion."
+    write_keywords = ["DROP", "DELETE", "REMOVE", "DETACH", "CREATE", "MERGE", "SET"]
+    if any(kw in upper for kw in write_keywords) and not allow_write:
+        return (
+            "Blocked: this query contains write operations. "
+            "Set allow_write=true to permit, or use the dedicated tools "
+            "(store_fact, store_facts, delete_document) for safe mutations."
+        )
 
     with driver.session() as session:
         result = session.run(query, **parsed_params)
