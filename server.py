@@ -146,11 +146,26 @@ def init_schema(driver):
 # Helpers
 # ---------------------------------------------------------------------------
 def embed(text: str) -> list[float]:
-    """Get embedding for a text string."""
+    """Get embedding for a single text string."""
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not set. Add it to .env or export it.")
     resp = get_openai().embeddings.create(
         input=text, model=EMBEDDING_MODEL, dimensions=EMBEDDING_DIMS
     )
     return resp.data[0].embedding
+
+
+def embed_batch(texts: list[str]) -> list[list[float]]:
+    """Get embeddings for multiple texts in a single API call."""
+    if not texts:
+        return []
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not set. Add it to .env or export it.")
+    resp = get_openai().embeddings.create(
+        input=texts, model=EMBEDDING_MODEL, dimensions=EMBEDDING_DIMS
+    )
+    # Sort by index to maintain order
+    return [item.embedding for item in sorted(resp.data, key=lambda x: x.index)]
 
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
@@ -158,13 +173,15 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
     if len(text) <= chunk_size:
         return [text]
 
+    # Clamp overlap to prevent stalling
+    overlap = min(overlap, chunk_size - 1)
+
     chunks = []
     start = 0
     while start < len(text):
         end = start + chunk_size
         # Try to break at sentence boundary
         if end < len(text):
-            # Look for sentence-ending punctuation near the end
             for sep in [". ", ".\n", "! ", "!\n", "? ", "?\n", "\n\n"]:
                 last_sep = text.rfind(sep, start + chunk_size // 2, end + 100)
                 if last_sep != -1:
@@ -173,12 +190,38 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
         chunk = text[start:end].strip()
         if chunk:
             chunks.append(chunk)
-        start = end - overlap
+        # Guarantee forward progress
+        new_start = end - overlap
+        if new_start <= start:
+            new_start = start + 1
+        start = new_start
     return chunks
 
 
 def make_chunk_id(source: str, index: int) -> str:
     return hashlib.sha256(f"{source}:{index}".encode()).hexdigest()[:16]
+
+
+import re
+
+# Strict pattern for Cypher identifiers — only alphanumeric + underscore
+_CYPHER_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def sanitize_cypher_label(label: str) -> str:
+    """Validate a string is safe to use as a Cypher label/relationship type.
+    Raises ValueError if it contains anything other than alphanumeric + underscore."""
+    if not _CYPHER_IDENT_RE.match(label):
+        raise ValueError(f"Invalid Cypher identifier: '{label}'. Only alphanumeric and underscores allowed.")
+    return label
+
+
+def parse_json_arg(value: str, arg_name: str) -> dict | list:
+    """Parse a JSON string with a clear error message on failure."""
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError) as e:
+        raise ValueError(f"Invalid JSON in '{arg_name}': {e}. Received: {value[:200]}")
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +230,7 @@ def make_chunk_id(source: str, index: int) -> str:
 mcp = FastMCP(
     "GraphRag",
     instructions="Knowledge Graph + Vector Search for persistent knowledge storage and retrieval. "
-    "Use ingest_document to add knowledge, query to search it, store_fact for triples, "
+    "Use ingest_document to add knowledge, query to search it, store_fact/store_facts for triples, "
     "get_neighbors to explore the graph.",
 )
 
@@ -272,8 +315,6 @@ def store_fact(
     """
     driver = get_driver()
     predicate_clean = predicate.upper().replace(" ", "_").replace("-", "_")
-
-    # Normalize type labels — title case, no spaces
     subject_type = subject_type.strip().title().replace(" ", "")
     obj_type = obj_type.strip().title().replace(" ", "")
 
@@ -281,22 +322,19 @@ def store_fact(
 
     with driver.session() as session:
         for entity_name, entity_type in [(subject, subject_type), (obj, obj_type)]:
-            # Check if entity already exists
             exists = session.run(
                 "MATCH (e:Entity {name: $name}) RETURN e.name AS name",
                 name=entity_name
             ).single()
 
             if exists:
-                # Entity exists — add type label if not already present, skip embedding
                 if entity_type and entity_type != "Entity":
                     session.run(
                         f"MATCH (e:Entity {{name: $name}}) SET e:{entity_type}",
                         name=entity_name
                     )
             else:
-                # New entity — embed and create with labels
-                emb = embed(entity_name)
+                emb = embed(f"{entity_name} ({entity_type})")
                 if entity_type and entity_type != "Entity":
                     session.run(
                         f"MERGE (e:Entity {{name: $name}}) "
@@ -336,11 +374,133 @@ def store_fact(
 
 
 @mcp.tool()
+def store_facts(facts_json: str) -> str:
+    """Store multiple knowledge triples in a single batch operation.
+
+    Much more efficient than calling store_fact repeatedly — uses batch embedding
+    and a single database transaction. Use this when ingesting multiple facts
+    from a single source.
+
+    Args:
+        facts_json: JSON array of fact objects. Each object should have:
+            - subject (str): Source entity name
+            - predicate (str): Relationship type
+            - obj (str): Target entity name
+            - context (str): Description of the relationship
+            - subject_type (str, optional): Entity type for subject. Default "Entity"
+            - obj_type (str, optional): Entity type for object. Default "Entity"
+            - source (str, optional): Document source name for provenance
+
+            Example: [{"subject": "Capsaicin", "predicate": "TARGETS", "obj": "TRPV1",
+                       "context": "TRPV1 agonist", "subject_type": "Chemical",
+                       "obj_type": "Concept", "source": "src-chen-2024-trpv1"}]
+    """
+    driver = get_driver()
+    facts = json.loads(facts_json)
+
+    if not facts:
+        return "No facts provided."
+
+    # Collect all unique entities that need to be created
+    with driver.session() as session:
+        # Find which entities already exist
+        all_entity_names = set()
+        for fact in facts:
+            all_entity_names.add(fact["subject"])
+            all_entity_names.add(fact["obj"])
+
+        existing = set()
+        for name in all_entity_names:
+            result = session.run(
+                "MATCH (e:Entity {name: $name}) RETURN e.name AS name",
+                name=name
+            ).single()
+            if result:
+                existing.add(name)
+
+        new_entities = all_entity_names - existing
+
+        # Build embedding texts for new entities — include type for better embeddings
+        entity_types_map = {}
+        for fact in facts:
+            st = fact.get("subject_type", "Entity").strip().title().replace(" ", "")
+            ot = fact.get("obj_type", "Entity").strip().title().replace(" ", "")
+            # First mention wins for type assignment
+            if fact["subject"] not in entity_types_map:
+                entity_types_map[fact["subject"]] = st
+            if fact["obj"] not in entity_types_map:
+                entity_types_map[fact["obj"]] = ot
+
+        # Batch embed all new entities
+        new_entities_list = sorted(new_entities)
+        if new_entities_list:
+            embed_texts = [f"{name} ({entity_types_map.get(name, 'Entity')})" for name in new_entities_list]
+            embeddings = embed_batch(embed_texts)
+
+            # Create all new entities
+            for name, emb in zip(new_entities_list, embeddings):
+                entity_type = entity_types_map.get(name, "Entity")
+                if entity_type and entity_type != "Entity":
+                    session.run(
+                        f"MERGE (e:Entity {{name: $name}}) "
+                        f"SET e.embedding = $embedding "
+                        f"SET e:{entity_type}",
+                        name=name, embedding=emb
+                    )
+                else:
+                    session.run(
+                        "MERGE (e:Entity {name: $name}) "
+                        "SET e.embedding = $embedding",
+                        name=name, embedding=emb
+                    )
+
+        # Update type labels for existing entities
+        for name in existing:
+            entity_type = entity_types_map.get(name, "Entity")
+            if entity_type and entity_type != "Entity":
+                session.run(
+                    f"MATCH (e:Entity {{name: $name}}) SET e:{entity_type}",
+                    name=name
+                )
+
+        # Create all relationships
+        rel_count = 0
+        for fact in facts:
+            predicate_clean = fact["predicate"].upper().replace(" ", "_").replace("-", "_")
+            context = fact.get("context", "")
+            session.run(
+                f"MATCH (s:Entity {{name: $subject}}), (o:Entity {{name: $obj}}) "
+                f"MERGE (s)-[r:{predicate_clean}]->(o) "
+                f"SET r.context = $context",
+                subject=fact["subject"], obj=fact["obj"], context=context
+            )
+            rel_count += 1
+
+            # Provenance links
+            source = fact.get("source", "")
+            if source:
+                for entity_name in [fact["subject"], fact["obj"]]:
+                    session.run(
+                        "MATCH (e:Entity {name: $entity}), (d:Document {source: $source}) "
+                        "MERGE (e)-[:EXTRACTED_FROM]->(d)",
+                        entity=entity_name, source=source
+                    )
+
+    return (
+        f"Batch stored: {rel_count} relationships, "
+        f"{len(new_entities)} new entities (embedded), "
+        f"{len(existing)} existing entities (reused). "
+        f"Total entities: {len(all_entity_names)}."
+    )
+
+
+@mcp.tool()
 def query(question: str, top_k: int = 5) -> str:
     """Query the knowledge graph using hybrid vector + graph search.
 
     Embeds the question, finds the most similar chunks and entities via vector search,
-    then traverses the graph to gather related context.
+    then automatically traverses 1 hop from matched entities to include connected
+    facts and relationships in the results.
 
     Args:
         question: Natural language question to search for.
@@ -369,36 +529,92 @@ def query(question: str, top_k: int = 5) -> str:
                 "score": round(record["score"], 4)
             })
 
-        # Vector search on entities
+        # Vector search on entities + auto-traverse 1 hop
         try:
-            entity_results = session.run(
+            # First, find matching entities
+            entity_matches = session.run(
                 dedent("""\
                     CALL db.index.vector.queryNodes('entity_embedding', $k, $embedding)
                     YIELD node, score
-                    MATCH (node)-[r]-(related)
-                    RETURN node.name AS entity, type(r) AS relationship,
-                           related.name AS related_entity, r.context AS context, score
+                    RETURN node.name AS entity, labels(node) AS labels, score
                     ORDER BY score DESC
-                    LIMIT $limit
                 """),
-                k=top_k, embedding=q_embedding, limit=top_k * 3
+                k=top_k, embedding=q_embedding
             )
-            for record in entity_results:
-                results.append({
-                    "type": "relationship",
-                    "entity": record["entity"],
-                    "relationship": record["relationship"],
-                    "related_entity": record["related_entity"],
-                    "context": record["context"],
+
+            matched_entities = []
+            for record in entity_matches:
+                labels = [l for l in record["labels"] if l != "Entity"]
+                matched_entities.append({
+                    "name": record["entity"],
+                    "type": labels[0] if labels else "Entity",
                     "score": round(record["score"], 4)
                 })
+
+            # For each matched entity, traverse 1 hop to get connected facts
+            for match in matched_entities:
+                # Outgoing relationships
+                outgoing = session.run(
+                    dedent("""\
+                        MATCH (e:Entity {name: $name})-[r]->(target:Entity)
+                        RETURN e.name AS from, type(r) AS rel, target.name AS to,
+                               labels(target) AS target_labels, r.context AS context
+                    """),
+                    name=match["name"]
+                )
+                for record in outgoing:
+                    target_labels = [l for l in record["target_labels"] if l != "Entity"]
+                    results.append({
+                        "type": "graph_fact",
+                        "from": record["from"],
+                        "relationship": record["rel"],
+                        "to": record["to"],
+                        "to_type": target_labels[0] if target_labels else "Entity",
+                        "context": record["context"],
+                        "score": match["score"],
+                        "match": match["name"],
+                    })
+
+                # Incoming relationships
+                incoming = session.run(
+                    dedent("""\
+                        MATCH (source:Entity)-[r]->(e:Entity {name: $name})
+                        RETURN source.name AS from, type(r) AS rel, e.name AS to,
+                               labels(source) AS source_labels, r.context AS context
+                    """),
+                    name=match["name"]
+                )
+                for record in incoming:
+                    source_labels = [l for l in record["source_labels"] if l != "Entity"]
+                    results.append({
+                        "type": "graph_fact",
+                        "from": record["from"],
+                        "from_type": source_labels[0] if source_labels else "Entity",
+                        "relationship": record["rel"],
+                        "to": record["to"],
+                        "context": record["context"],
+                        "score": match["score"],
+                        "match": match["name"],
+                    })
+
         except Exception as e:
             logger.debug(f"Entity search note: {e}")
 
     if not results:
         return "No results found. The knowledge graph may be empty — try ingesting some documents first."
 
-    return json.dumps(results, indent=2)
+    # Deduplicate graph facts (same fact can appear from multiple matched entities)
+    seen = set()
+    deduped = []
+    for r in results:
+        if r["type"] == "graph_fact":
+            key = (r["from"], r["relationship"], r["to"])
+            if key in seen:
+                continue
+            seen.add(key)
+        deduped.append(r)
+
+    return json.dumps(deduped, indent=2)
 
 
 @mcp.tool()
@@ -458,16 +674,20 @@ def list_entities(pattern: str = "", limit: int = 50) -> str:
         if pattern:
             result = session.run(
                 "MATCH (e:Entity) WHERE toLower(e.name) CONTAINS toLower($pattern) "
-                "RETURN e.name AS name ORDER BY name LIMIT $limit",
+                "RETURN e.name AS name, labels(e) AS labels ORDER BY name LIMIT $limit",
                 pattern=pattern, limit=limit
             )
         else:
             result = session.run(
-                "MATCH (e:Entity) RETURN e.name AS name ORDER BY name LIMIT $limit",
+                "MATCH (e:Entity) RETURN e.name AS name, labels(e) AS labels ORDER BY name LIMIT $limit",
                 limit=limit
             )
 
-        entities = [record["name"] for record in result]
+        entities = []
+        for record in result:
+            labels = [l for l in record["labels"] if l != "Entity"]
+            type_str = f" [{labels[0]}]" if labels else ""
+            entities.append(f"{record['name']}{type_str}")
 
     if not entities:
         return "No entities found." + (f" (filter: '{pattern}')" if pattern else "")
@@ -583,6 +803,14 @@ def graph_stats() -> str:
             result = session.run(f"MATCH (n:{label}) RETURN count(n) AS count")
             stats[label] = result.single()["count"]
 
+        # Count typed entities
+        typed_result = session.run(
+            "MATCH (e:Entity) WITH labels(e) AS labs "
+            "UNWIND labs AS lab WITH lab WHERE lab <> 'Entity' "
+            "RETURN lab AS type, count(*) AS count ORDER BY count DESC"
+        )
+        typed = {r["type"]: r["count"] for r in typed_result}
+
         rel_result = session.run(
             "MATCH ()-[r]->() RETURN type(r) AS type, count(r) AS count ORDER BY count DESC LIMIT 20"
         )
@@ -593,12 +821,224 @@ def graph_stats() -> str:
         f"  Documents: {stats['Document']}",
         f"  Chunks:    {stats['Chunk']}",
         f"  Entities:  {stats['Entity']}",
-        f"  Relationships:"
     ]
+    if typed:
+        lines.append("  Entity types:")
+        for t, c in typed.items():
+            lines.append(f"    {t}: {c}")
+    lines.append("  Relationships:")
     for rel_type, count in rels.items():
         lines.append(f"    {rel_type}: {count}")
     if not rels:
         lines.append("    (none)")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_schema() -> str:
+    """Get the current graph schema — node labels, relationship types, and property keys.
+
+    Use this before writing Cypher queries to know what labels, relationships,
+    and properties exist in the graph. Essential for text-to-Cypher translation.
+    """
+    driver = get_driver()
+
+    with driver.session() as session:
+        # Node labels and their counts
+        label_result = session.run(
+            "MATCH (n) UNWIND labels(n) AS label "
+            "RETURN label, count(*) AS count ORDER BY count DESC"
+        )
+        labels = {r["label"]: r["count"] for r in label_result}
+
+        # Relationship types and their counts
+        rel_result = session.run(
+            "MATCH ()-[r]->() RETURN type(r) AS type, count(*) AS count ORDER BY count DESC"
+        )
+        rels = {r["type"]: r["count"] for r in rel_result}
+
+        # Property keys per label (sample from first 100 nodes of each type)
+        label_props = {}
+        for label in labels:
+            props_result = session.run(
+                f"MATCH (n:{label}) WITH n LIMIT 100 "
+                f"UNWIND keys(n) AS key "
+                f"WITH key WHERE key <> 'embedding' "
+                f"RETURN DISTINCT key ORDER BY key"
+            )
+            label_props[label] = [r["key"] for r in props_result]
+
+        # Relationship patterns: which labels connect via which relationship types
+        pattern_result = session.run(
+            "MATCH (s)-[r]->(t) "
+            "WITH labels(s) AS sl, type(r) AS rel, labels(t) AS tl "
+            "RETURN DISTINCT sl, rel, tl LIMIT 100"
+        )
+        patterns = []
+        for r in pattern_result:
+            src = [l for l in r["sl"] if l != "Entity"]
+            tgt = [l for l in r["tl"] if l != "Entity"]
+            src_str = src[0] if src else "Entity"
+            tgt_str = tgt[0] if tgt else "Entity"
+            patterns.append(f"(:{src_str})-[:{r['rel']}]->(:{tgt_str})")
+
+    lines = ["Graph Schema:", "", "Node Labels:"]
+    for label, count in labels.items():
+        props = label_props.get(label, [])
+        props_str = f" — properties: {', '.join(props)}" if props else ""
+        lines.append(f"  {label} ({count}){props_str}")
+
+    lines.append("")
+    lines.append("Relationship Types:")
+    for rel, count in rels.items():
+        lines.append(f"  {rel} ({count})")
+
+    lines.append("")
+    lines.append("Patterns:")
+    for p in sorted(set(patterns)):
+        lines.append(f"  {p}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def find_path(from_entity: str, to_entity: str, max_depth: int = 6) -> str:
+    """Find the shortest path between two entities in the knowledge graph.
+
+    This is a classic graph query that vector search cannot do. Use it to
+    discover how two seemingly unrelated entities are connected.
+
+    Args:
+        from_entity: The starting entity name.
+        to_entity: The target entity name.
+        max_depth: Maximum path length to search (default 6, max 10).
+    """
+    driver = get_driver()
+    max_depth = min(max_depth, 10)
+
+    with driver.session() as session:
+        # Shortest path
+        result = session.run(
+            dedent(f"""\
+                MATCH path = shortestPath(
+                    (a:Entity {{name: $from}})-[*..{max_depth}]-(b:Entity {{name: $to}})
+                )
+                RETURN [n IN nodes(path) | n.name] AS node_names,
+                       [r IN relationships(path) | type(r)] AS rel_types,
+                       [r IN relationships(path) | r.context] AS contexts,
+                       length(path) AS hops
+            """),
+            **{"from": from_entity, "to": to_entity}
+        )
+
+        record = result.single()
+        if not record:
+            return f"No path found between '{from_entity}' and '{to_entity}' within {max_depth} hops."
+
+        names = record["node_names"]
+        rels = record["rel_types"]
+        contexts = record["contexts"]
+        hops = record["hops"]
+
+        # Build readable path with contexts
+        path_parts = []
+        for i, name in enumerate(names):
+            path_parts.append(f"({name})")
+            if i < len(rels):
+                ctx = f" [{contexts[i]}]" if contexts[i] else ""
+                path_parts.append(f" -[{rels[i]}]{ctx}-> ")
+
+        path_str = "".join(path_parts)
+
+        # Also find alternative paths
+        alt_result = session.run(
+            dedent(f"""\
+                MATCH path = (a:Entity {{name: $from}})-[*..{max_depth}]-(b:Entity {{name: $to}})
+                WITH path, length(path) AS hops
+                ORDER BY hops
+                SKIP 1 LIMIT 3
+                RETURN [n IN nodes(path) | n.name] AS node_names,
+                       [r IN relationships(path) | type(r)] AS rel_types,
+                       length(path) AS hops
+            """),
+            **{"from": from_entity, "to": to_entity}
+        )
+
+        alt_paths = []
+        for alt in alt_result:
+            alt_names = alt["node_names"]
+            alt_rels = alt["rel_types"]
+            parts = []
+            for i, name in enumerate(alt_names):
+                parts.append(f"({name})")
+                if i < len(alt_rels):
+                    parts.append(f" -[{alt_rels[i]}]-> ")
+            alt_paths.append("".join(parts))
+
+    lines = [
+        f"Shortest path ({hops} hops):",
+        path_str,
+    ]
+    if alt_paths:
+        lines.append(f"\nAlternative paths ({len(alt_paths)}):")
+        for ap in alt_paths:
+            lines.append(f"  {ap}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def find_similar_entities(entity_name: str, top_k: int = 5) -> str:
+    """Find entities most similar to a given entity by embedding distance.
+
+    Useful for discovering related concepts, finding potential duplicates,
+    or exploring the neighborhood of an entity in semantic space (not graph space).
+
+    Args:
+        entity_name: The entity to find similar entities to.
+        top_k: Number of similar entities to return (default 5).
+    """
+    driver = get_driver()
+
+    with driver.session() as session:
+        # Get the entity's embedding
+        entity = session.run(
+            "MATCH (e:Entity {name: $name}) RETURN e.embedding AS embedding",
+            name=entity_name
+        ).single()
+
+        if not entity or not entity["embedding"]:
+            return f"Entity '{entity_name}' not found or has no embedding."
+
+        # Vector search using the entity's own embedding
+        results = session.run(
+            dedent("""\
+                CALL db.index.vector.queryNodes('entity_embedding', $k, $embedding)
+                YIELD node, score
+                WHERE node.name <> $name
+                RETURN node.name AS name, labels(node) AS labels, score
+                ORDER BY score DESC
+            """),
+            k=top_k + 1, embedding=entity["embedding"], name=entity_name
+        )
+
+        similar = []
+        for record in results:
+            labels = [l for l in record["labels"] if l != "Entity"]
+            type_str = f" [{labels[0]}]" if labels else ""
+            similar.append({
+                "name": record["name"],
+                "type": type_str,
+                "similarity": round(record["score"], 4)
+            })
+
+    if not similar:
+        return f"No similar entities found for '{entity_name}'."
+
+    lines = [f"Entities similar to '{entity_name}':"]
+    for s in similar[:top_k]:
+        lines.append(f"  - {s['name']}{s['type']} (similarity: {s['similarity']})")
 
     return "\n".join(lines)
 
@@ -667,38 +1107,31 @@ Call `list_entities` to see what's already in the graph. This prevents duplicate
 ### Step 2: Ingest the document
 Call `ingest_document` with the full text and source name. This chunks the text and creates embeddings for vector search.
 
-### Step 3: Extract entities
-Read through the text and identify important entities. Use these allowed entity types (pick the most specific):
+### Step 3: Extract entities and relationships
+Read through the text and identify important entities and their relationships.
 
+**Entity types** (pick the most specific):
 {entity_types}
 
-If an entity doesn't fit any type, use "Entity" as the label.
-
-**Entity naming rules:**
-- Normalize names: proper case, no abbreviations unless that IS the name (CGRP, TRPV1 stay uppercase)
-- Merge synonyms: "B. bassiana" and "Beauveria bassiana" -> "Beauveria bassiana". Use the full canonical form.
-- Be selective — extract what matters for cross-document connections, not every noun
-- Prefer specific types: Chemical over Entity for "Substance P", Organism over Entity for "E. coli", Condition over Concept for "Allergic Rhinitis"
-
-### Step 4: Extract relationships
-For each pair of related entities, identify the relationship. Use these allowed types:
-
+**Relationship types** (pick the most specific):
 {rel_types}
-
-If no specific type fits, use "RELATED_TO" with a descriptive context.
 
 {DIRECTION_GUIDE}
 
-### Step 5: Store facts
-For each entity-relationship-entity triple, call `store_fact` with:
-- subject: the source entity (the Subject in the natural sentence)
-- predicate: the relationship type
-- obj: the target entity (the Object in the natural sentence)
-- context: a specific, quantitative description. "91.67% mortality at day 4" not "high mortality".
+### Step 4: Store facts in batch
+Build a JSON array of all facts and call `store_facts` once (much faster than individual `store_fact` calls). Each fact needs:
+- subject, predicate, obj, context, subject_type, obj_type, source
 
-If an entity from this source already exists in the graph (from Step 1), reuse its exact name to create cross-document connections.
+**Rules:**
+- Normalize names: proper case, abbreviations that ARE the name stay uppercase (CGRP, TRPV1)
+- Merge synonyms to canonical form: "B. bassiana" -> "Beauveria bassiana"
+- Be specific and quantitative in context: "91.67% mortality at day 4" not "high mortality"
+- Check relationship direction reads as natural sentence
+- Prefer specific entity types: Chemical not Entity, Condition not Concept
+- Reuse exact entity names from Step 1 for cross-document connections
+- Set source to the document source name for provenance tracking
 
-### Step 6: Report
+### Step 5: Report
 Summarize what was stored: number of chunks, entities extracted, relationships created, and any cross-references to existing entities.""",
         }
     ]
@@ -728,17 +1161,20 @@ def query_knowledge_prompt(question: str) -> list[dict]:
 Follow these steps to find a comprehensive answer:
 
 ### Step 1: Semantic search
-Call `query` with the question. This searches both text chunks (vector similarity) and entities (graph + vector). Review the results for relevant information.
+Call `query` with the question. This now automatically:
+- Searches text chunks by vector similarity
+- Searches entities by vector similarity
+- Traverses 1 hop from matched entities to include connected facts
 
-### Step 2: Explore the graph
-If the query results mention specific entities, call `get_neighbors` on the most relevant ones to discover related information that vector search might have missed. Follow relationship chains for multi-hop reasoning.
+Review all results — chunk matches for raw text, graph_fact matches for structured knowledge.
 
-### Step 3: Targeted search (if needed)
-If the initial results are insufficient:
-- Try `list_entities` with relevant name patterns to find entities you might have missed
-- Use `cypher_query` for structured queries (e.g., "find all entities of type Technology that have DEPENDS_ON relationships")
+### Step 2: Deep exploration (if needed)
+If Step 1 found relevant entities but you need more depth:
+- Call `get_neighbors` on key entities to traverse further (2+ hops)
+- Use `list_entities` with patterns to find related entities
+- Use `cypher_query` for structured queries (e.g. "MATCH (c:Chemical)-[:TARGETS]->(t) RETURN c.name, t.name")
 
-### Step 4: Synthesize
+### Step 3: Synthesize
 Combine findings from vector search and graph traversal into a coherent answer. Cite the sources (document names) where the information came from.
 
 If the knowledge graph doesn't contain enough information to answer the question, say so clearly and suggest what could be ingested to fill the gap.""",
@@ -762,7 +1198,7 @@ def review_ontology_prompt() -> list[dict]:
 ## Instructions
 
 ### Step 1: Get graph statistics
-Call `graph_stats` to see overall counts.
+Call `graph_stats` to see overall counts and entity type distribution.
 
 ### Step 2: Inspect entity types
 Use `cypher_query` to analyze the graph structure:
