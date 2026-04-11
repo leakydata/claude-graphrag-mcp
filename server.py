@@ -245,30 +245,53 @@ def ingest_document(text: str, source: str, metadata: str = "{}") -> str:
 
 
 @mcp.tool()
-def store_fact(subject: str, predicate: str, obj: str, context: str = "") -> str:
+def store_fact(
+    subject: str,
+    predicate: str,
+    obj: str,
+    context: str = "",
+    subject_type: str = "Entity",
+    obj_type: str = "Entity",
+) -> str:
     """Store a knowledge triple (subject -[predicate]-> object) in the graph.
 
-    Creates Entity nodes and a typed relationship between them.
-    Optionally embeds context for vector search.
+    Creates typed nodes and a relationship between them. Nodes get both
+    a specific label (e.g. Person, Chemical) AND the base Entity label
+    for unified querying.
 
     Args:
-        subject: The source entity (e.g. "AuthService").
-        predicate: The relationship type (e.g. "DEPENDS_ON", "USES", "AUTHORED_BY").
-        obj: The target entity (e.g. "PostgreSQL").
-        context: Optional description or context about this relationship.
+        subject: The source entity name (e.g. "Capsaicin", "Jianwei Chen").
+        predicate: The relationship type (e.g. "TARGETS", "AUTHORED", "CAUSES").
+        obj: The target entity name (e.g. "TRPV1", "Neurogenic Inflammation").
+        context: Description of this relationship. Be specific and quantitative.
+        subject_type: Entity type for subject (e.g. "Chemical", "Person", "Paper", "Method"). Default "Entity".
+        obj_type: Entity type for object (e.g. "Concept", "Condition", "Organism"). Default "Entity".
     """
     driver = get_driver()
     predicate_clean = predicate.upper().replace(" ", "_").replace("-", "_")
 
+    # Normalize type labels — title case, no spaces
+    subject_type = subject_type.strip().title().replace(" ", "")
+    obj_type = obj_type.strip().title().replace(" ", "")
+
     with driver.session() as session:
-        # Create/update entities with embeddings
-        for entity_name in [subject, obj]:
+        # Create/update entities with embeddings and typed labels
+        for entity_name, entity_type in [(subject, subject_type), (obj, obj_type)]:
             emb = embed(entity_name + (f" — {context}" if context else ""))
-            session.run(
-                "MERGE (e:Entity {name: $name}) "
-                "SET e.embedding = $embedding",
-                name=entity_name, embedding=emb
-            )
+            # Always add :Entity as base label + the specific type label
+            if entity_type and entity_type != "Entity":
+                session.run(
+                    f"MERGE (e:Entity {{name: $name}}) "
+                    f"SET e.embedding = $embedding "
+                    f"SET e:{entity_type}",
+                    name=entity_name, embedding=emb
+                )
+            else:
+                session.run(
+                    "MERGE (e:Entity {name: $name}) "
+                    "SET e.embedding = $embedding",
+                    name=entity_name, embedding=emb
+                )
 
         # Create relationship (using APOC-free approach with dynamic rel type)
         session.run(
@@ -278,7 +301,9 @@ def store_fact(subject: str, predicate: str, obj: str, context: str = "") -> str
             subject=subject, obj=obj, context=context
         )
 
-    return f"Stored: ({subject}) -[{predicate_clean}]-> ({obj})" + (f" | {context}" if context else "")
+    subj_label = f":{subject_type}" if subject_type != "Entity" else ""
+    obj_label = f":{obj_type}" if obj_type != "Entity" else ""
+    return f"Stored: ({subject}{subj_label}) -[{predicate_clean}]-> ({obj}{obj_label})" + (f" | {context}" if context else "")
 
 
 @mcp.tool()
