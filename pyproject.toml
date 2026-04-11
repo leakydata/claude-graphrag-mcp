@@ -1,0 +1,14 @@
+[project]
+name = "graphrag-mcp"
+version = "0.1.0"
+description = "Knowledge Graph + Vector Search MCP server powered by Neo4j and OpenAI embeddings"
+requires-python = ">=3.11"
+dependencies = [
+    "neo4j>=5.0",
+    "openai>=1.0",
+    "mcp>=1.0",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+graphrag-mcp = "server:mcp.run"
